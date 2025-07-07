@@ -1,20 +1,19 @@
-# Use an official Node.js runtime as a parent image
+# Use a lightweight Node.js image
 FROM node:20-alpine
 
-# Set the working directory in the container
-WORKDIR /app
+# Set the working directory inside the container
+WORKDIR /usr/src/app
 
-# Copy package.json and package-lock.json (if available)
+# Copy package files and install dependencies
+# This caches the node_modules layer for faster rebuilds
 COPY package*.json ./
+RUN npm install --only=production
 
-# Install dependencies
-RUN npm install
-
-# Copy the rest of the application code
+# Copy the rest of your backend source code
 COPY . .
 
-# Expose the port the app runs on
+# Your app runs on port 3001 inside the container
 EXPOSE 3001
 
-# Define the command to run the app
-CMD ["npm", "start"]
+# The command to start your server
+CMD [ "node", "server.js" ]
