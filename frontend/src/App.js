@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 
 // Base URL for your backend API.
-const API_BASE_URL = 'https://api.chathub.plets.win';
+const API_BASE_URL = 'localhost:3001';
 
 function App() {
     // --- Existing State ---
