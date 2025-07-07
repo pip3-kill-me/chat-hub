@@ -20,11 +20,31 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 // --- CORS Configuration ---
-app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization']
-}));
+// List of domains that are allowed to make requests to this server
+const whitelist = [
+    'http://localhost:3000',          // For local React development
+    'http://localhost:8281',          // For accessing the Docker container locally
+    'https://chathub.plets.win'       // Your deployed production site
+];
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+
+    if (whitelist.indexOf(origin) !== -1) {
+      // If the origin is in our whitelist, allow it
+      callback(null, true);
+    } else {
+      // Otherwise, block it
+      callback(new Error('Not allowed by CORS'));
+    }
+  }
+};
+
+// Use the new flexible CORS options
+app.use(cors(corsOptions));
+
 
 app.use(express.json());
 
@@ -230,9 +250,6 @@ const authenticateToken = (req, res, next) => {
     if (token == null) return res.sendStatus(401);
 
     jwt.verify(token, JWT_SECRET, (err, user) => {
-        // DEBUGGING LOG
-        console.log('2. Decoded user from token in middleware:', user);
-
         if (err) return res.sendStatus(403);
         req.user = user;
         next();
@@ -292,9 +309,6 @@ app.post('/api/login', async (req, res) => {
             { expiresIn: '8h' }
         );
         
-        // DEBUGGING LOG
-        console.log('1. Payload being put into token on login:', { userId: user.user_id, userName: user.username });
-        
         const { password_hash, ...userPayload } = user;
         res.json({ token, ...userPayload });
     } catch (err) {
@@ -304,10 +318,6 @@ app.post('/api/login', async (req, res) => {
 
 app.put('/api/profile', authenticateToken, async (req, res) => {
     const { userId } = req.user;
-
-    // DEBUGGING LOG
-    console.log('3. Data received in /api/profile route:', { fullUserObject: req.user, extractedUserId: userId });
-
     const { userName } = req.body;
     if (!userName || userName.trim() === '') return res.status(400).json({ message: 'Display name cannot be empty.' });
     try {
