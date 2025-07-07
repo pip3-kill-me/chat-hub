@@ -1,6 +1,8 @@
 // backend/server.js
 const express = require('express');
 const { Pool } = require('pg');
+const http = require('http');
+const { WebSocketServer } = require('ws');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
@@ -13,14 +15,108 @@ require('dotenv').config();
 const app = express();
 const port = process.env.PORT || 3001;
 
+// --- Create HTTP and WebSocket Servers ---
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
+
 // --- CORS Configuration ---
 app.use(cors({
-    origin: '*', // For development, allow all origins. In production, specify your frontend URL.
+    origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 app.use(express.json());
+
+// --- JWT Secret ---
+const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret_key';
+
+// --- WebSocket Signaling Logic ---
+const clients = new Map();
+
+wss.on('connection', (ws) => {
+    const clientId = `user_${Date.now()}`;
+    clients.set(clientId, { ws });
+    console.log(`Client ${clientId} connected, waiting for auth`);
+
+    const authTimeout = setTimeout(() => {
+        if (!clients.get(clientId)?.userInfo) {
+            console.log(`Client ${clientId} failed to auth in time, disconnecting.`);
+            ws.close();
+        }
+    }, 5000);
+
+    ws.on('message', (message) => {
+        const parsedMessage = JSON.parse(message);
+        const { type, payload } = parsedMessage;
+        const clientData = clients.get(clientId);
+
+        if (type === 'auth' && !clientData.userInfo) {
+            try {
+                const decoded = jwt.verify(payload.token, JWT_SECRET);
+                clientData.userInfo = {
+                    userId: decoded.userId,
+                    userName: decoded.userName,
+                    profilePhotoUrl: decoded.profilePhotoUrl,
+                };
+                clearTimeout(authTimeout);
+                console.log(`Client ${clientId} authenticated as ${decoded.userName}`);
+
+                const existingPeers = Array.from(clients.values())
+                    .filter(c => c.userInfo && c.userInfo.userId !== decoded.userId)
+                    .map(c => ({ clientId: c.clientId, ...c.userInfo }));
+
+                ws.send(JSON.stringify({
+                    type: 'connection-success',
+                    payload: { clientId, existingPeers }
+                }));
+
+                const newPeerPayload = { clientId, ...clientData.userInfo };
+                for (const [id, c] of clients) {
+                    if (id !== clientId && c.userInfo) {
+                        c.ws.send(JSON.stringify({ type: 'new-peer', payload: newPeerPayload }));
+                    }
+                }
+                return;
+            } catch (err) {
+                console.log(`Client ${clientId} auth failed`, err.message);
+                ws.close();
+                return;
+            }
+        }
+        
+        if (!clientData.userInfo) return;
+
+        const { targetClientId } = payload;
+        const targetClient = clients.get(targetClientId);
+
+        if (targetClient && targetClient.userInfo) {
+            const relayMessage = JSON.stringify({
+                type,
+                payload: { ...payload, sourceClientId: clientId }
+            });
+            targetClient.ws.send(relayMessage);
+        }
+    });
+
+    ws.on('close', () => {
+        clearTimeout(authTimeout);
+        const clientData = clients.get(clientId);
+        if (clientData && clientData.userInfo) {
+            console.log(`Client ${clientId} (${clientData.userInfo.userName}) disconnected`);
+            const peerLeftMessage = JSON.stringify({ type: 'peer-left', payload: { clientId } });
+            for (const [id, c] of clients) {
+                if (id !== clientId && c.userInfo) {
+                    c.ws.send(peerLeftMessage);
+                }
+            }
+        } else {
+            console.log(`Unauthenticated client ${clientId} disconnected`);
+        }
+        clients.delete(clientId);
+    });
+});
+
 
 // --- PostgreSQL Database Connection ---
 const pool = new Pool({
@@ -32,10 +128,9 @@ const pool = new Pool({
 });
 
 // --- Database Schema Initialization with Retry Logic ---
-async function initializeDbSchemaWithRetry(retries = 10, delay = 5000) { // Increased retries for robustness
+async function initializeDbSchemaWithRetry(retries = 10, delay = 5000) {
     for (let i = 0; i < retries; i++) {
         try {
-            console.log(`Attempting to connect to database and initialize schema (Attempt ${i + 1}/${retries})...`);
             const client = await pool.connect();
             console.log('Database connected successfully.');
 
@@ -46,7 +141,7 @@ async function initializeDbSchemaWithRetry(retries = 10, delay = 5000) { // Incr
                     username VARCHAR(255) UNIQUE NOT NULL,
                     password_hash VARCHAR(255) NOT NULL,
                     is_admin BOOLEAN DEFAULT FALSE,
-                    profile_photo_url VARCHAR(255) DEFAULT '/uploads/default-avatar.png', -- New: Default profile photo
+                    profile_photo_url VARCHAR(255) DEFAULT '/uploads/default-avatar.svg',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
@@ -60,7 +155,7 @@ async function initializeDbSchemaWithRetry(retries = 10, delay = 5000) { // Incr
 
                 CREATE TABLE IF NOT EXISTS messages (
                     id SERIAL PRIMARY KEY,
-                    channel_id INTEGER NOT NULL, -- New: Link to channel
+                    channel_id INTEGER NOT NULL,
                     user_id VARCHAR(255) NOT NULL,
                     username VARCHAR(255) NOT NULL,
                     text TEXT,
@@ -71,35 +166,26 @@ async function initializeDbSchemaWithRetry(retries = 10, delay = 5000) { // Incr
                     FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
                 );
             `);
-
-            // Check and create a default channel if none exist
             const res = await client.query('SELECT COUNT(*) FROM channels');
             if (parseInt(res.rows[0].count) === 0) {
-                console.log('No channels found. Creating a default "General" channel.');
                 await client.query(
                     'INSERT INTO channels (name, created_by_user_id) VALUES ($1, $2)',
-                    ['General', 'system'] // 'system' as a placeholder user_id for initial channel
+                    ['General', 'system']
                 );
             }
-
-            client.release(); // Release the client back to the pool
+            client.release();
             console.log('Database schema initialized or already exists.');
-            return; // Success, exit the retry loop
+            return;
         } catch (err) {
             console.error(`Error connecting to database or initializing schema:`, err.message);
             if (i < retries - 1) {
-                console.log(`Retrying in ${delay / 1000} seconds...`);
                 await new Promise(res => setTimeout(res, delay));
             } else {
                 console.error('Max retries reached. Could not connect to database or initialize schema.');
-                // In a real application, you might want to exit the process here
-                // process.exit(1);
             }
         }
     }
 }
-
-// Call the initialization function
 initializeDbSchemaWithRetry();
 
 
@@ -107,68 +193,52 @@ initializeDbSchemaWithRetry();
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 const PROFILE_PHOTOS_DIR = path.join(UPLOADS_DIR, 'profile_photos');
 
-// Ensure uploads directory exists
-if (!fs.existsSync(UPLOADS_DIR)) {
-    fs.mkdirSync(UPLOADS_DIR);
-}
-// Ensure profile photos directory exists
-if (!fs.existsSync(PROFILE_PHOTOS_DIR)) {
-    fs.mkdirSync(PROFILE_PHOTOS_DIR);
-}
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR);
+if (!fs.existsSync(PROFILE_PHOTOS_DIR)) fs.mkdirSync(PROFILE_PHOTOS_DIR);
 
-// Create a default avatar if it doesn't exist
-const defaultAvatarPath = path.join(UPLOADS_DIR, 'default-avatar.png');
+const defaultAvatarPath = path.join(UPLOADS_DIR, 'default-avatar.svg');
 if (!fs.existsSync(defaultAvatarPath)) {
-    // Create a simple placeholder image (1x1 transparent PNG)
-    const defaultAvatarBuffer = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=", 'base64');
-    fs.writeFileSync(defaultAvatarPath, defaultAvatarBuffer);
-    console.log('Default avatar created.');
+    const defaultAvatarSvg = `
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="1.5">
+  <path d="M12 12C14.2091 12 16 10.2091 16 8C16 5.79086 14.2091 4 12 4C9.79086 4 8 5.79086 8 8C8 10.2091 9.79086 12 12 12Z" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M20 21C20 16.5817 16.4183 13 12 13C7.58172 13 4 16.5817 4 21" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+    `;
+    fs.writeFileSync(defaultAvatarPath, defaultAvatarSvg.trim());
+    console.log('Default SVG avatar created.');
 }
-
 
 const messageStorage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, UPLOADS_DIR); // General uploads go here
-    },
-    filename: (req, file, cb) => {
-        cb(null, `${Date.now()}-${file.originalname}`);
-    }
+    destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+    filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`)
 });
 const uploadMessageFile = multer({ storage: messageStorage });
 
 const profilePhotoStorage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, PROFILE_PHOTOS_DIR); // Profile photos go here
-    },
-    filename: (req, file, cb) => {
-        // Use user ID to ensure unique profile photo per user
-        cb(null, `${req.user.userId}-${file.originalname}`);
-    }
+    destination: (req, file, cb) => cb(null, PROFILE_PHOTOS_DIR),
+    filename: (req, file, cb) => cb(null, `${req.user.userId}-${file.originalname}`)
 });
 const uploadProfilePhoto = multer({ storage: profilePhotoStorage });
 
-
-// Serve uploaded files statically
 app.use('/uploads', express.static(UPLOADS_DIR));
 
-// --- JWT Secret ---
-const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret_key';
 
-// --- Middleware for JWT Authentication ---
+// --- Middleware ---
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
-
     if (token == null) return res.sendStatus(401);
 
     jwt.verify(token, JWT_SECRET, (err, user) => {
+        // DEBUGGING LOG
+        console.log('2. Decoded user from token in middleware:', user);
+
         if (err) return res.sendStatus(403);
-        req.user = user; // Contains userId, userName, isAdmin, profilePhotoUrl
+        req.user = user;
         next();
     });
 };
 
-// --- Middleware for Admin Authorization ---
 const authorizeAdmin = (req, res, next) => {
     if (!req.user || !req.user.isAdmin) {
         return res.status(403).json({ message: 'Access denied: Admin privileges required.' });
@@ -176,75 +246,41 @@ const authorizeAdmin = (req, res, next) => {
     next();
 };
 
-// --- Authentication Endpoints ---
-
-// Register User
+// --- API Endpoints ---
 app.post('/api/register', async (req, res) => {
     const { username, password } = req.body;
-    if (!username || !password) {
-        return res.status(400).json({ message: 'Username and password are required.' });
-    }
-
+    if (!username || !password) return res.status(400).json({ message: 'Username and password are required.' });
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
         const userId = `user_${Date.now()}`;
-
         const result = await pool.query(
             'INSERT INTO users (user_id, username, password_hash) VALUES ($1, $2, $3) RETURNING user_id, username, is_admin, profile_photo_url',
             [userId, username, hashedPassword]
         );
         const newUser = result.rows[0];
-
         const token = jwt.sign(
-            {
-                userId: newUser.user_id,
-                userName: newUser.username,
-                isAdmin: newUser.is_admin,
-                profilePhotoUrl: newUser.profile_photo_url
-            },
+            { userId: newUser.user_id, userName: newUser.username, isAdmin: newUser.is_admin, profilePhotoUrl: newUser.profile_photo_url },
             JWT_SECRET,
-            { expiresIn: '8h' } // Token valid for 8 hours
+            { expiresIn: '8h' }
         );
-
-        res.status(201).json({
-            message: 'User registered successfully',
-            token,
-            userId: newUser.user_id,
-            userName: newUser.username,
-            isAdmin: newUser.is_admin,
-            profilePhotoUrl: newUser.profile_photo_url
-        });
+        res.status(201).json({ token, userId: newUser.user_id, userName: newUser.username, isAdmin: newUser.is_admin, profilePhotoUrl: newUser.profile_photo_url });
     } catch (err) {
-        if (err.code === '23505') {
-            return res.status(409).json({ message: 'Username already exists.' });
-        }
-        console.error('Registration error:', err);
+        if (err.code === '23505') return res.status(409).json({ message: 'Username already exists.' });
         res.status(500).json({ message: 'Internal server error.' });
     }
 });
 
-// Login User
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
-    if (!username || !password) {
-        return res.status(400).json({ message: 'Username and password are required.' });
-    }
-
+    if (!username || !password) return res.status(400).json({ message: 'Username and password are required.' });
     try {
         const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
         const user = result.rows[0];
-
-        if (!user) {
+        if (!user || !await bcrypt.compare(password, user.password_hash)) {
             return res.status(401).json({ message: 'Invalid credentials.' });
         }
-
-        const isPasswordValid = await bcrypt.compare(password, user.password_hash);
-        if (!isPasswordValid) {
-            return res.status(401).json({ message: 'Invalid credentials.' });
-        }
-
         await pool.query('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE user_id = $1', [user.user_id]);
-
+        
         const token = jwt.sign(
             {
                 userId: user.user_id,
@@ -253,127 +289,75 @@ app.post('/api/login', async (req, res) => {
                 profilePhotoUrl: user.profile_photo_url
             },
             JWT_SECRET,
-            { expiresIn: '8h' } // Token valid for 8 hours
+            { expiresIn: '8h' }
         );
-
-        res.json({
-            message: 'Logged in successfully',
-            token,
-            userId: user.user_id,
-            userName: user.username,
-            isAdmin: user.is_admin,
-            profilePhotoUrl: user.profile_photo_url
-        });
+        
+        // DEBUGGING LOG
+        console.log('1. Payload being put into token on login:', { userId: user.user_id, userName: user.username });
+        
+        const { password_hash, ...userPayload } = user;
+        res.json({ token, ...userPayload });
     } catch (err) {
-        console.error('Login error:', err);
         res.status(500).json({ message: 'Internal server error.' });
     }
 });
 
-// --- User Profile Endpoints ---
 app.put('/api/profile', authenticateToken, async (req, res) => {
-    const { userName } = req.body; // Only allow updating username for now
     const { userId } = req.user;
 
-    if (!userName || userName.trim() === '') {
-        return res.status(400).json({ message: 'Display name cannot be empty.' });
-    }
+    // DEBUGGING LOG
+    console.log('3. Data received in /api/profile route:', { fullUserObject: req.user, extractedUserId: userId });
 
+    const { userName } = req.body;
+    if (!userName || userName.trim() === '') return res.status(400).json({ message: 'Display name cannot be empty.' });
     try {
         const result = await pool.query(
             'UPDATE users SET username = $1 WHERE user_id = $2 RETURNING user_id, username, is_admin, profile_photo_url',
             [userName, userId]
         );
         const updatedUser = result.rows[0];
-
-        if (!updatedUser) {
-            return res.status(404).json({ message: 'User not found.' });
-        }
-
-        // Generate a new token with updated user info
+        if (!updatedUser) return res.status(404).json({ message: 'User not found.' });
+        
         const newToken = jwt.sign(
-            {
-                userId: updatedUser.user_id,
-                userName: updatedUser.username,
-                isAdmin: updatedUser.is_admin,
-                profilePhotoUrl: updatedUser.profile_photo_url
-            },
+            { userId: updatedUser.user_id, userName: updatedUser.username, isAdmin: updatedUser.is_admin, profilePhotoUrl: updatedUser.profile_photo_url },
             JWT_SECRET,
             { expiresIn: '8h' }
         );
-
-        res.json({
-            message: 'Profile updated successfully',
-            token: newToken, // Send new token
-            userId: updatedUser.user_id,
-            userName: updatedUser.username,
-            isAdmin: updatedUser.is_admin,
-            profilePhotoUrl: updatedUser.profile_photo_url
-        });
+        res.json({ token: newToken, userId: updatedUser.user_id, userName: updatedUser.username, isAdmin: updatedUser.is_admin, profilePhotoUrl: updatedUser.profile_photo_url });
     } catch (err) {
-        if (err.code === '23505') { // Unique violation for username
-            return res.status(409).json({ message: 'This display name is already taken.' });
-        }
-        console.error('Error updating profile:', err);
+        if (err.code === '23505') return res.status(409).json({ message: 'This display name is already taken.' });
         res.status(500).json({ message: 'Internal server error.' });
     }
 });
 
 app.post('/api/profile/photo', authenticateToken, uploadProfilePhoto.single('profilePhoto'), async (req, res) => {
     const { userId } = req.user;
-    const file = req.file;
-
-    if (!file) {
-        return res.status(400).json({ message: 'No profile photo uploaded.' });
-    }
-
+    if (!req.file) return res.status(400).json({ message: 'No profile photo uploaded.' });
     try {
-        const photoUrl = `/uploads/profile_photos/${file.filename}`;
-
+        const photoUrl = `/uploads/profile_photos/${req.file.filename}`;
         const result = await pool.query(
             'UPDATE users SET profile_photo_url = $1 WHERE user_id = $2 RETURNING user_id, username, is_admin, profile_photo_url',
             [photoUrl, userId]
         );
         const updatedUser = result.rows[0];
-
-        if (!updatedUser) {
-            return res.status(404).json({ message: 'User not found.' });
-        }
-
-        // Generate a new token with updated user info
+        if (!updatedUser) return res.status(404).json({ message: 'User not found.' });
+        
         const newToken = jwt.sign(
-            {
-                userId: updatedUser.user_id,
-                userName: updatedUser.username,
-                isAdmin: updatedUser.is_admin,
-                profilePhotoUrl: updatedUser.profile_photo_url
-            },
+            { userId: updatedUser.user_id, userName: updatedUser.username, isAdmin: updatedUser.is_admin, profilePhotoUrl: updatedUser.profile_photo_url },
             JWT_SECRET,
             { expiresIn: '8h' }
         );
-
-        res.json({
-            message: 'Profile photo updated successfully',
-            token: newToken, // Send new token
-            userId: updatedUser.user_id,
-            userName: updatedUser.username,
-            isAdmin: updatedUser.is_admin,
-            profilePhotoUrl: updatedUser.profile_photo_url
-        });
+        res.json({ token: newToken, userId: updatedUser.user_id, userName: updatedUser.username, isAdmin: updatedUser.is_admin, profilePhotoUrl: updatedUser.profile_photo_url });
     } catch (err) {
-        console.error('Error uploading profile photo:', err);
         res.status(500).json({ message: 'Internal server error.' });
     }
 });
 
-
-// --- Channel Endpoints ---
 app.get('/api/channels', authenticateToken, async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM channels ORDER BY name ASC');
         res.json(result.rows);
     } catch (err) {
-        console.error('Error fetching channels:', err);
         res.status(500).json({ message: 'Internal server error.' });
     }
 });
@@ -381,11 +365,9 @@ app.get('/api/channels', authenticateToken, async (req, res) => {
 app.post('/api/channels', authenticateToken, async (req, res) => {
     const { name } = req.body;
     const { userId } = req.user;
-
     if (!name || name.trim() === '') {
         return res.status(400).json({ message: 'Channel name cannot be empty.' });
     }
-
     try {
         const result = await pool.query(
             'INSERT INTO channels (name, created_by_user_id) VALUES ($1, $2) RETURNING *',
@@ -393,76 +375,53 @@ app.post('/api/channels', authenticateToken, async (req, res) => {
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
-        if (err.code === '23505') { // Unique violation for channel name
+        if (err.code === '23505') {
             return res.status(409).json({ message: 'Channel with this name already exists.' });
         }
-        console.error('Error creating channel:', err);
         res.status(500).json({ message: 'Internal server error.' });
     }
 });
 
-
-// --- Chat Endpoints (Modified for Channels and Pagination) ---
-
-// Get Messages for a specific channel with pagination
 app.get('/api/messages/:channelId', authenticateToken, async (req, res) => {
     const { channelId } = req.params;
-    const limit = parseInt(req.query.limit) || 20; // Default limit to 20
-    const beforeId = req.query.beforeId; // Cursor for older messages (load more)
-    const sinceId = req.query.sinceId; // Cursor for newer messages (polling)
+    const limit = parseInt(req.query.limit) || 20;
+    const beforeId = req.query.beforeId;
+    const sinceId = req.query.sinceId;
 
-    let queryText = `
-        SELECT m.*, u.profile_photo_url
-        FROM messages m
-        JOIN users u ON m.user_id = u.user_id
-        WHERE m.channel_id = $1
-    `;
+    let queryText = `SELECT m.*, u.profile_photo_url FROM messages m JOIN users u ON m.user_id = u.user_id WHERE m.channel_id = $1`;
     const queryParams = [channelId];
-    let orderByClause = 'ORDER BY m.id DESC'; // Default order for fetching latest or older
+    let orderByClause = 'ORDER BY m.id DESC';
 
     if (beforeId) {
         queryText += ` AND m.id < $${queryParams.length + 1}`;
         queryParams.push(beforeId);
     } else if (sinceId) {
         queryText += ` AND m.id > $${queryParams.length + 1}`;
-        queryParams.push(sinceId);
-        orderByClause = 'ORDER BY m.id ASC'; // For new messages, order ascending
+        orderByClause = 'ORDER BY m.id ASC';
     }
 
     queryText += ` ${orderByClause} LIMIT $${queryParams.length + 1}`;
-    queryParams.push(limit + 1); // Fetch one more to check if there are more messages
+    queryParams.push(limit + 1);
 
     try {
         const result = await pool.query(queryText, queryParams);
-        let fetchedMessages = result.rows;
-
-        const hasMore = fetchedMessages.length > limit;
-        const messagesToSend = hasMore ? fetchedMessages.slice(0, limit) : fetchedMessages;
-
-        // If fetching new messages, they are already in chronological order (due to ASC order by ID)
-        // If fetching older messages, they were fetched DESC and need to be reversed for chronological display
-        if (!sinceId) { // Only reverse if not fetching new messages
-            messagesToSend.reverse();
-        }
-
-        res.json({ messages: messagesToSend, hasMore });
-
+        let messages = result.rows;
+        const hasMore = messages.length > limit;
+        if (hasMore) messages = messages.slice(0, limit);
+        if (!sinceId) messages.reverse();
+        res.json({ messages, hasMore });
     } catch (err) {
-        console.error('Error fetching messages for channel:', err);
         res.status(500).json({ message: 'Internal server error.' });
     }
 });
 
-// Send Message to a specific channel
 app.post('/api/messages/:channelId', authenticateToken, async (req, res) => {
     const { channelId } = req.params;
     const { text } = req.body;
     const { userId, userName } = req.user;
-
     if (!text || text.trim() === '') {
         return res.status(400).json({ message: 'Message text cannot be empty.' });
     }
-
     try {
         const result = await pool.query(
             'INSERT INTO messages (channel_id, user_id, username, text) VALUES ($1, $2, $3, $4) RETURNING *',
@@ -470,97 +429,71 @@ app.post('/api/messages/:channelId', authenticateToken, async (req, res) => {
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
-        console.error('Error sending message:', err);
         res.status(500).json({ message: 'Internal server error.' });
     }
 });
 
-// File Upload to a specific channel
 app.post('/api/upload/:channelId', authenticateToken, uploadMessageFile.single('file'), async (req, res) => {
     const { channelId } = req.params;
     const { userId, userName } = req.user;
-    const file = req.file;
-
-    if (!file) {
-        return res.status(400).json({ message: 'No file uploaded.' });
-    }
-
+    if (!req.file) return res.status(400).json({ message: 'No file uploaded.' });
     try {
-        const fileUrl = `/uploads/${file.filename}`;
+        const fileUrl = `/uploads/${req.file.filename}`;
         const result = await pool.query(
             'INSERT INTO messages (channel_id, user_id, username, file_url, file_name, file_type) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-            [channelId, userId, userName, fileUrl, file.originalname, file.mimetype]
+            [channelId, userId, userName, fileUrl, req.file.originalname, req.file.mimetype]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
-        console.error('Error uploading file:', err);
         res.status(500).json({ message: 'Internal server error.' });
     }
 });
 
-// --- Admin Endpoints ---
-
-// Get All Users (Admin Only)
 app.get('/api/admin/users', authenticateToken, authorizeAdmin, async (req, res) => {
     try {
         const result = await pool.query('SELECT user_id, username, is_admin, created_at, last_login, profile_photo_url FROM users ORDER BY created_at ASC');
         res.json(result.rows);
     } catch (err) {
-        console.error('Error fetching users (admin):', err);
         res.status(500).json({ message: 'Internal server error.' });
     }
 });
 
-// Toggle Admin Status (Admin Only)
 app.post('/api/admin/users/:userId/toggle-admin', authenticateToken, authorizeAdmin, async (req, res) => {
-    const { userId } = req.params;
-    const { isAdmin } = req.body;
-
-    if (req.user.userId === userId) {
+    const { userId: targetUserId } = req.params;
+    const { userId: adminUserId } = req.user;
+    if (adminUserId === targetUserId) {
         return res.status(400).json({ message: 'You cannot change your own admin status.' });
     }
-
     try {
         const result = await pool.query(
             'UPDATE users SET is_admin = $1 WHERE user_id = $2 RETURNING user_id, username, is_admin, profile_photo_url',
-            [isAdmin, userId]
+            [req.body.isAdmin, targetUserId]
         );
-
-        if (result.rows.length === 0) {
-            return res.status(404).json({ message: 'User not found.' });
-        }
+        if (result.rows.length === 0) return res.status(404).json({ message: 'User not found.' });
         res.json({ message: 'Admin status updated successfully', user: result.rows[0] });
     } catch (err) {
-        console.error('Error toggling admin status:', err);
         res.status(500).json({ message: 'Internal server error.' });
     }
 });
 
-// Delete Message (Admin Only)
 app.delete('/api/admin/messages/:messageId', authenticateToken, authorizeAdmin, async (req, res) => {
     const { messageId } = req.params;
     try {
         const result = await pool.query('DELETE FROM messages WHERE id = $1 RETURNING *', [messageId]);
-        if (result.rows.length === 0) {
-            return res.status(404).json({ message: 'Message not found.' });
-        }
-        // Also delete the associated file if it exists
-        if (result.rows[0].file_url && result.rows[0].file_url.startsWith('/uploads/')) {
-            const filePath = path.join(UPLOADS_DIR, path.basename(result.rows[0].file_url));
+        if (result.rows.length === 0) return res.status(404).json({ message: 'Message not found.' });
+        if (result.rows[0].file_url) {
+            const filePath = path.join(__dirname, result.rows[0].file_url);
             fs.unlink(filePath, (err) => {
                 if (err) console.error('Error deleting file from disk:', err);
-                else console.log('File deleted from disk:', filePath);
             });
         }
         res.json({ message: 'Message deleted successfully' });
     } catch (err) {
-        console.error('Error deleting message:', err);
         res.status(500).json({ message: 'Internal server error.' });
     }
 });
 
-
 // Start the server
-app.listen(port, () => {
+server.listen(port, () => {
     console.log(`Backend server listening on port ${port}`);
 });
